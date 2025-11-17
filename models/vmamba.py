@@ -1358,24 +1358,24 @@ class VSSM(nn.Module):
         x = x.contiguous().view(batch_size, height, width, mc, channels)
         x = x.permute(0, 3, 4, 1, 2).contiguous().view(batch_size, mc * channels, height, width)
         patch_merged = self.patch_merge(x)
-        # x = patch_merged
+        x = patch_merged
         
-        attn_feature = self.middle_cross_attn(middle_features)
-        if attn_feature.shape[-2:] != patch_merged.shape[-2:]:
-            attn_feature = F.interpolate(
-                attn_feature,
-                size=patch_merged.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
+        # attn_feature = self.middle_cross_attn(middle_features)
+        # if attn_feature.shape[-2:] != patch_merged.shape[-2:]:
+        #     attn_feature = F.interpolate(
+        #         attn_feature,
+        #         size=patch_merged.shape[-2:],
+        #         mode="bilinear",
+        #         align_corners=False,
+        #     )
         
              
-        # # 98.77%
-        residual = self.patch_residual_act(patch_merged)
-        # pass merged patches through two attention branches and sum their outputs
-        eca_out = self.eca(attn_feature)
-        esa_out = self.esa(attn_feature)
-        x = eca_out + esa_out + residual
+        # # # 98.77%
+        # residual = self.patch_residual_act(patch_merged)
+        # # pass merged patches through two attention branches and sum their outputs
+        # eca_out = self.eca(attn_feature)
+        # esa_out = self.esa(attn_feature)
+        # x = eca_out + esa_out + residual
         
       
         if not self.channel_first:
