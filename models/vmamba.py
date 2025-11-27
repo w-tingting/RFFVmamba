@@ -51,7 +51,6 @@ def _5d_to_3d(x, use_reshape=False):
         x = x.view(n, mc * C, H * W)
     return x
 
-
 class RFF_Token_Embed(nn.Module):
     def __init__(self, mc, kernel_type, block_conf, image_size=56, stage=1):
         super(RFF_Token_Embed, self).__init__()
@@ -289,6 +288,13 @@ class _SqueezeExcite(nn.Module):
         scale = self.sigmoid(scale)
         x_proj = self.proj(x)
         return x_proj * scale
+
+
+class _FlattenTo1x1(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            return x.unsqueeze(-1).unsqueeze(-1)
+        return x
 
 
 class MiddleFeatureCrossAttention(nn.Module):
@@ -937,7 +943,6 @@ class SS2Dv2(nn.Module):
 
 
 
-
 # =====================================================
 class VSSBlock(nn.Module):
     def __init__(
@@ -1046,7 +1051,7 @@ class VSSM(nn.Module):
         in_chans=3, 
         num_classes=43, 
         depths=[2, 2, 9, 2], 
-        dims=[96, 192, 384, 768], # 96
+        dims=32, # 96
         # =========================
         mc=1, 
         kernel_type="arccos", 
@@ -1089,9 +1094,10 @@ class VSSM(nn.Module):
         self.channel_first = (norm_layer.lower() in ["bn", "ln2d"]) # True ln2d
         self.num_classes = num_classes
         self.num_layers = len(depths)
+        print("dims:",dims)
         if isinstance(dims, int):
             dims = [int(dims * 2 ** i_layer) for i_layer in range(self.num_layers)] # [96,192,384,768]
-       
+             
         self.num_features = dims[-1]
         # self.num_features = 32
         self.dims = dims
@@ -1135,6 +1141,8 @@ class VSSM(nn.Module):
         self.esa = EnhancedSpatialAttention(self.branch_channels)
         self.patch_residual_act = nn.SiLU()
         self.middle_cross_attn = MiddleFeatureCrossAttention(self.dims[0])
+        self.patch_embed_cam = nn.Identity()
+        self.fusion_tap = nn.Identity()
 
         with torch.no_grad():
             dummy_height = dummy_width = imgsize
@@ -1190,6 +1198,7 @@ class VSSM(nn.Module):
                 # =================
                 _SS2D=_SS2D,
             ))
+        self.layer_taps = nn.ModuleList([nn.Identity() for _ in range(self.num_layers)])
             
         self.head_out_channels = 64
         # self.head_out_channels = 32
@@ -1197,6 +1206,7 @@ class VSSM(nn.Module):
         # self.rff_feature_dim = self.head_out_channels * 16 * 16
         self.rff_feature_dim = self.head_out_channels * 4 * 4
         self.rff_layer_norm = torch.nn.LayerNorm(self.rff_feature_dim, eps=1e-5)
+        self._rff_layer_norm_shape = self.rff_feature_dim
         self.head = Conv_RFF(
             self.num_features,
             self.head_out_channels,
@@ -1208,6 +1218,7 @@ class VSSM(nn.Module):
             1,
             False,
         )
+        self.head_cam = nn.Identity()
         
         self.fully = FullyConnected(self.rff_feature_dim, self.num_classes, self.mc, False)
 
@@ -1351,31 +1362,49 @@ class VSSM(nn.Module):
             downsample=downsample,
         ))
 
+    def _ensure_rff_head_shapes(self, feature_dim: int, device: torch.device, dtype: torch.dtype) -> None:
+        if feature_dim != self.rff_feature_dim:
+            self.rff_feature_dim = feature_dim
+            self.rff_layer_norm = torch.nn.LayerNorm(feature_dim, eps=1e-5).to(device=device, dtype=dtype)
+            self._rff_layer_norm_shape = feature_dim
+            self.fully = FullyConnected(feature_dim, self.num_classes, self.mc, False).to(device=device, dtype=dtype)
+        else:
+            if getattr(self, "_rff_layer_norm_shape", None) != feature_dim:
+                self.rff_layer_norm = torch.nn.LayerNorm(feature_dim, eps=1e-5).to(device=device, dtype=dtype)
+                self._rff_layer_norm_shape = feature_dim
+            elif (self.rff_layer_norm.weight.device != device) or (self.rff_layer_norm.weight.dtype != dtype):
+                self.rff_layer_norm = self.rff_layer_norm.to(device=device, dtype=dtype)
+
+            if any(param.device != device or param.dtype != dtype for param in self.fully.parameters()):
+                self.fully = self.fully.to(device=device, dtype=dtype)
+
     def forward(self, x: torch.Tensor):
         
-        x, middle_features, batch_size, mc, channels, height, width = self.patch_embed(x)
+        patch_tokens, middle_features, batch_size, mc, channels, height, width = self.patch_embed(x)
         
-        x = x.contiguous().view(batch_size, height, width, mc, channels)
+        x = patch_tokens.contiguous().view(batch_size, height, width, mc, channels)
         x = x.permute(0, 3, 4, 1, 2).contiguous().view(batch_size, mc * channels, height, width)
+        x = self.patch_embed_cam(x)
         patch_merged = self.patch_merge(x)
-        x = patch_merged
+        # x = patch_merged
         
-        # attn_feature = self.middle_cross_attn(middle_features)
-        # if attn_feature.shape[-2:] != patch_merged.shape[-2:]:
-        #     attn_feature = F.interpolate(
-        #         attn_feature,
-        #         size=patch_merged.shape[-2:],
-        #         mode="bilinear",
-        #         align_corners=False,
-        #     )
+        attn_feature = self.middle_cross_attn(middle_features)
+        if attn_feature.shape[-2:] != patch_merged.shape[-2:]:
+            attn_feature = F.interpolate(
+                attn_feature,
+                size=patch_merged.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
         
              
-        # # # 98.77%
-        # residual = self.patch_residual_act(patch_merged)
-        # # pass merged patches through two attention branches and sum their outputs
-        # eca_out = self.eca(attn_feature)
-        # esa_out = self.esa(attn_feature)
-        # x = eca_out + esa_out + residual
+        # # 98.77%
+        residual = self.patch_residual_act(patch_merged)
+        # pass merged patches through two attention branches and sum their outputs
+        eca_out = self.eca(attn_feature)
+        esa_out = self.esa(attn_feature)
+        fusion = eca_out + esa_out + residual
+        x = self.fusion_tap(fusion)
         
       
         if not self.channel_first:
@@ -1385,18 +1414,30 @@ class VSSM(nn.Module):
             pos_embed = self.pos_embed.permute(0, 2, 3, 1) if not self.channel_first else self.pos_embed
             x = x + pos_embed
         
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
             x = layer(x)
+            x = self.layer_taps[idx](x)
   
         feat = x.unsqueeze(1).repeat(1, self.mc, 1, 1, 1)
          
         head_out = self.head(feat)
        
+        
+        if head_out.dim() == 5:
+            b, mc, c, h, w = head_out.shape
+            cam_ready = head_out.contiguous().view(b, mc * c, h, w)
+            cam_ready = self.head_cam(cam_ready)
+            head_out = cam_ready.view(b, mc, c, h, w)
+        else:
+            head_out = self.head_cam(head_out)
+
         bs = head_out.shape[0]
         head_out = head_out.reshape(bs, self.mc, -1)
         head_out = head_out.transpose(0, 1).contiguous() # (mc, bs, feat_dim)
+        feature_dim = head_out.shape[-1]
+        self._ensure_rff_head_shapes(feature_dim, head_out.device, head_out.dtype)
         
-        head_out = self.rff_layer_norm(head_out) # 5,64,256
+        head_out = self.rff_layer_norm(head_out) # 5,64,feature_dim
         logits_mc = self.fully(head_out) # 5,64,43
         # classification head
         attn = F.softmax(logits_mc.mean(dim=(1)),dim=0).mean(dim=1)# 43
@@ -1468,8 +1509,15 @@ class VSSM(nn.Module):
             for j in range(100):
                 change_name(f"layers.{i}.blocks.{j}.ln_1", f"layers.{i}.blocks.{j}.norm")
                 change_name(f"layers.{i}.blocks.{j}.self_attention", f"layers.{i}.blocks.{j}.op")
-        change_name("norm", "classifier.norm")
-        change_name("head", "classifier.head")
+        # legacy checkpoints stored the RFF head inside classifier.head
+        if check_name("classifier.head.theta_logsigma", strict=True):
+            change_name("classifier.head", "head")
+
+        # legacy checkpoints kept the linear classifier as top-level norm/head modules
+        if (not check_name("classifier.norm", strict=False)) and check_name("norm.weight", strict=True):
+            change_name("norm", "classifier.norm")
+        if (not check_name("classifier.head", strict=False)) and check_name("head.weight", strict=True):
+            change_name("head", "classifier.head")
 
         return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
